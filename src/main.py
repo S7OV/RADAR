@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+from config.config import parseConfig, Config
 import os
 import logging
 import pandas as pd
@@ -16,25 +16,17 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from bs4 import BeautifulSoup
 
-# ----------------------------
-# Конфигурация
-# ----------------------------
-TELEGRAM_BOT_TOKEN = ""
-CLOUD_API_KEY = ''
-
-DATA_FILE = "df_fin.csv"
-META_FILE = "top_clusters_meta.csv"
-LAST_UPDATE_FILE = "last_update.txt"
-RADAR_CACHE_FILE = "radar_cache.json"
-TRUSTED_SOURCES_FILE = "trusted_sources.json"
+conf = parseConfig()
 
 client = OpenAI(
-    api_key=CLOUD_API_KEY,
+    api_key=conf.CLOUD_API_KEY,
     base_url="https://foundation-models.api.cloud.ru/v1"
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
 
 # ----------------------------
 # Вспомогательные функции
@@ -44,21 +36,21 @@ def today_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def was_updated_today():
-    if not os.path.exists(LAST_UPDATE_FILE):
+    if not os.path.exists(conf.LAST_UPDATE_FILE):
         return False
-    with open(LAST_UPDATE_FILE, "r") as f:
+    with open(conf.LAST_UPDATE_FILE, "r") as f:
         last = f.read().strip()
     if last != today_iso():
         return False
-    if not os.path.exists(DATA_FILE) or not os.path.exists(META_FILE):
+    if not os.path.exists(conf.DATA_FILE) or not os.path.exists(conf.META_FILE):
         return False
     return True
 
 def mark_updated_today():
-    with open(LAST_UPDATE_FILE, "w") as f:
+    with open(conf.LAST_UPDATE_FILE, "w") as f:
         f.write(today_iso())
     # Сбрасываем кэш при обновлении данных
-    for f in [RADAR_CACHE_FILE, TRUSTED_SOURCES_FILE]:
+    for f in [conf.RADAR_CACHE_FILE, conf.TRUSTED_SOURCES_FILE]:
         if os.path.exists(f):
             os.remove(f)
 
@@ -182,9 +174,9 @@ def generate_trusted_sources():
             messages=[{"role": "user", "content": prompt}]
         )
         output = response.choices[0].message.content
-        data = json.loads(fix_json(output))
+        data = json.loads(str(fix_json(output)))
         trusted = set(data.get("trusted_sources", []))
-        with open(TRUSTED_SOURCES_FILE, "w", encoding="utf-8") as f:
+        with open(conf.TRUSTED_SOURCES_FILE, "w", encoding="utf-8") as f:
             json.dump({"trusted_sources": list(trusted)}, f, indent=2, ensure_ascii=False)
         return trusted
     except Exception as e:
@@ -192,15 +184,15 @@ def generate_trusted_sources():
         return {"reuters.com", "bloomberg.com", "ft.com", "wsj.com", "cnbc.com"}
 
 # ----------------------------
-# Сохранение метаданных топ-кластеров с улучшенным hotness
+# Сохранение метаданных топ-кластеров с композитной метрикой горячести
 # ----------------------------
-def save_top_clusters_meta(df_fin, output_file=META_FILE):
+def save_top_clusters_meta(df_fin, output_file=conf.META_FILE):
     logger.info("🔍 Запуск кластеризации...")
     # Преобразуем даты
     df_fin['V21DATE_dt'] = pd.to_datetime(df_fin['V21DATE'], format='%Y%m%d%H%M%S', errors='coerce')
     df_fin = df_fin.dropna(subset=['V21DATE_dt']).copy()
 
-    # Извлекаем слова из URL для семантики
+    # Извлекаем слова из URL
     df_fin['url_slug_words'] = df_fin['V2DOCUMENTIDENTIFIER'].apply(extract_slug_words_from_url)
     df_fin['semantic_text'] = (
         df_fin['V1THEMES'].fillna('') + ' ' +
@@ -215,24 +207,24 @@ def save_top_clusters_meta(df_fin, output_file=META_FILE):
         df_fin['url_slug_words']
     )
 
-    # Векторизация и кластеризация
+    # Кластеризация
     vectorizer = TfidfVectorizer(stop_words='english', max_features=1000, ngram_range=(1, 2))
     tfidf_matrix = vectorizer.fit_transform(df_fin['semantic_text'])
     clustering = DBSCAN(eps=0.01, min_samples=2, metric='cosine').fit(tfidf_matrix)
     df_fin['semantic_cluster'] = clustering.labels_
 
-    # Загружаем trusted sources
-    if os.path.exists(TRUSTED_SOURCES_FILE):
-        with open(TRUSTED_SOURCES_FILE, "r", encoding="utf-8") as f:
+    # Trusted sources
+    if os.path.exists(conf.TRUSTED_SOURCES_FILE):
+        with open(conf.TRUSTED_SOURCES_FILE, "r", encoding="utf-8") as f:
             trusted_sources = set(json.load(f)["trusted_sources"])
     else:
         trusted_sources = generate_trusted_sources()
 
-    # Берём топ-10 кластеров по размеру
-    top_clusters = df_fin['semantic_cluster'].value_counts().head(10)
+    # Обрабатываем ВСЕ кластеры (кроме шума)
+    all_clusters = df_fin['semantic_cluster'].unique()
     meta_rows = []
 
-    for cluster_id in top_clusters.index:
+    for cluster_id in all_clusters:
         if cluster_id == -1:
             continue
 
@@ -246,22 +238,51 @@ def save_top_clusters_meta(df_fin, output_file=META_FILE):
         if not dates or not urls:
             continue
 
-        # Извлечение сущностей
-        themes = cluster_data['V1THEMES'].dropna().str.split(';').explode().value_counts().head(10).index.tolist()
+        # Сущности
+        themes_series = cluster_data['V1THEMES'].dropna().str.split(';').explode()
+        themes = themes_series.value_counts().head(10).index.tolist()
         persons = cluster_data['V1PERSONS'].dropna().str.split(';').explode().value_counts().head(5).index.tolist()
         orgs = cluster_data['V1ORGANIZATIONS'].dropna().str.split(';').explode().value_counts().head(5).index.tolist()
 
         start_date = min(dates)
         end_date = max(dates)
-
-        # === НОВАЯ МЕТРИКА ГОРЯЧЕСТИ НА ОСНОВЕ ВСПЛЕСКА ===
-        cluster_data['hour'] = cluster_data['V21DATE_dt'].dt.floor('h')
-        mentions_per_hour = cluster_data.groupby('hour').size()
-        max_mentions_in_hour = mentions_per_hour.max() if not mentions_per_hour.empty else 0
-        hotness = min(1.0, max_mentions_in_hour / 30.0)  # 30 упоминаний/час = максимум
-
-        # Дополнительные метаданные
+        duration_hours = (end_date - start_date).total_seconds() / 3600
         num_sources = len(set(sources))
+
+        # === 1. Внезапность (25%) ===
+        surprise_score = len(cluster_data) / (duration_hours + 1)
+        surprise_score = min(1.0, surprise_score / 50.0)
+
+        # === 2. Материальность (25%) ===
+        financial_prefixes = {'ECON_', 'MARKET_', 'TAX_'}
+        financial_theme_count = sum(
+            1 for t in themes_series if any(t.startswith(p) for p in financial_prefixes)
+        )
+        materiality_score = financial_theme_count / len(themes_series) if len(themes_series) > 0 else 0
+        materiality_score = min(1.0, materiality_score)
+
+        # === 3. Скорость распространения (20%) ===
+        spread_speed = num_sources / (duration_hours + 0.1)
+        spread_speed = min(1.0, spread_speed / 10.0)
+
+        # === 4. Масштаб — разнообразие тем (15%) ===
+        theme_prefixes = {t.split('_')[0] for t in themes if '_' in t and t.split('_')[0].isupper()}
+        breadth_score = min(1.0, len(theme_prefixes) / 4.0)
+
+        # === 5. Достоверность (15%) ===
+        trusted_count = sum(1 for s in sources if s and s.lower() in trusted_sources)
+        trust_ratio = trusted_count / max(num_sources, 1)
+        confirmation_ratio = min(1.0, num_sources / 5.0)
+        credibility_score = (trust_ratio + confirmation_ratio) / 2
+
+        # === Итоговая горячесть ===
+        hotness = (
+            0.25 * surprise_score +
+            0.25 * materiality_score +
+            0.20 * spread_speed +
+            0.15 * breadth_score +
+            0.15 * credibility_score
+        )
 
         meta_rows.append({
             "cluster_id": cluster_id,
@@ -272,12 +293,27 @@ def save_top_clusters_meta(df_fin, output_file=META_FILE):
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "hotness": round(hotness, 3),
+            "citation_index": len(cluster_data),  # ← новое поле
+            "hotness_breakdown": json.dumps({
+                "surprise": round(surprise_score, 3),
+                "materiality": round(materiality_score, 3),
+                "spread_speed": round(spread_speed, 3),
+                "breadth": round(breadth_score, 3),
+                "credibility": round(credibility_score, 3)
+            }),
             "num_sources": num_sources,
             "sources_list": sources
         })
-
-    pd.DataFrame(meta_rows).to_csv(output_file, index=False)
-    logger.info(f"✅ Сохранено {len(meta_rows)} топ-кластеров в {output_file}")
+        
+    # Ранжируем по горячести и сохраняем топ-10
+    if meta_rows:
+        meta_df = pd.DataFrame(meta_rows)
+        meta_df = meta_df.sort_values('hotness', ascending=False).head(10)
+        meta_df.to_csv(output_file, index=False)
+        logger.info(f"✅ Сохранено {len(meta_df)} топ-кластеров по горячести в {output_file}")
+    else:
+        pd.DataFrame().to_csv(output_file, index=False)
+        logger.info("⚠️ Нет валидных кластеров для сохранения.")
 
 # ----------------------------
 # Загрузка GDELT и обработка
@@ -348,12 +384,12 @@ def fetch_gdelt_and_save():
             first_theme = themes.split(';')[0].strip()
             return (
                 first_theme.startswith('ECON_') or
-                first_theme.startswith('TAX_FNCACT') or
-                'FINANCE' in first_theme or
                 first_theme.startswith('MARKET_') or
                 first_theme.startswith('RATING_') or
                 first_theme.startswith('COMMODITY_') or
-                first_theme.startswith('CURRENCY_')
+                first_theme.startswith('CURRENCY_') or
+                first_theme == 'FINANCE_COMPANY' or
+                first_theme == 'FINANCE_BANKING'
             )
 
         df['is_financial'] = df['V1THEMES'].apply(starts_with_financial_theme)
@@ -361,7 +397,7 @@ def fetch_gdelt_and_save():
         df_fin = df[df['is_financial']].copy()
         if df_fin.empty:
             raise Exception("Нет финансовых записей")
-        df_fin.to_csv(DATA_FILE, index=False)
+        df_fin.to_csv(conf.DATA_FILE, index=False)
         save_top_clusters_meta(df_fin)
         mark_updated_today()
         logger.info(f"✅ Обработка завершена: {len(df_fin)} записей, кластеры сохранены.")
@@ -375,9 +411,11 @@ def fetch_gdelt_and_save():
 # ----------------------------
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        raise ValueError
     if was_updated_today():
         try:
-            df_fin = pd.read_csv(DATA_FILE)
+            df_fin = pd.read_csv(conf.DATA_FILE)
             df_fin['V21DATE_dt'] = pd.to_datetime(df_fin['V21DATE'], format='%Y%m%d%H%M%S', errors='coerce')
             min_date = df_fin['V21DATE_dt'].min()
             max_date = df_fin['V21DATE_dt'].max()
@@ -395,7 +433,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = fetch_gdelt_and_save()
     if success:
         try:
-            df_fin = pd.read_csv(DATA_FILE)
+            df_fin = pd.read_csv(conf.DATA_FILE)
             df_fin['V21DATE_dt'] = pd.to_datetime(df_fin['V21DATE'], format='%Y%m%d%H%M%S', errors='coerce')
             min_date = df_fin['V21DATE_dt'].min()
             max_date = df_fin['V21DATE_dt'].max()
@@ -412,20 +450,32 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось обновить данные. Попробуйте позже.")
 
 async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Отправка из кэша
-    if os.path.exists(RADAR_CACHE_FILE):
-        with open(RADAR_CACHE_FILE, "r", encoding="utf-8") as f:
+    if update.message is None:
+        raise ValueError
+    # --- Отправка из кэша ---
+    if os.path.exists(conf.RADAR_CACHE_FILE):
+        with open(conf.RADAR_CACHE_FILE, "r", encoding="utf-8") as f:
             cached_data = json.load(f)
         await update.message.reply_text("📬 Отправляю кэшированный отчёт...")
         await asyncio.sleep(5)
         for item in cached_data:
+            citation_index = item.get("citation_index", len(item.get("sources", [])))
+            breakdown = item.get("hotness_breakdown", {})
+            hotness_details = (
+                f"🧩 Горячесть: внезапность={breakdown.get('surprise', 0):.2f}, "
+                f"материальность={breakdown.get('materiality', 0):.2f}, "
+                f"скорость={breakdown.get('spread_speed', 0):.2f}, "
+                f"масштаб={breakdown.get('breadth', 0):.2f}, "
+                f"достоверность={breakdown.get('credibility', 0):.2f}"
+            )
             output = (
                 f"🔥 <b>{item['headline']}</b>\n"
-                f"📊 Горячесть: {item['hotness']}\n"
+                f"📊 Горячесть: {item['hotness']} | Цитирование: {citation_index}\n"
+                f"{hotness_details}\n"
                 f"⏱ Почему сейчас: {item['why_now']}\n"
                 f"🏷 Сущности: {', '.join(item['entities'])}\n"
                 f"📅 Хронология: {item['timeline']}\n"
-                f"🔗 Источники: {' | '.join([f'<a href=\"{s}\">{i+1}</a>' for i, s in enumerate(item['sources']) if s])}\n\n"
+                f"🔗 Источники: {' | '.join([f'<a href=\"{s}\">{i+1}</a>' for i, s in enumerate(item['sources']) if s])}\n"
                 f"<b>Черновик:</b>\n"
                 f"<b>{item['draft']['title']}</b>\n"
                 f"{item['draft']['lead']}\n"
@@ -440,13 +490,13 @@ async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Отчёт отправлен из кэша!")
         return
 
-    # Генерация нового отчёта
-    if not os.path.exists(META_FILE):
+    # --- Генерация нового отчёта ---
+    if not os.path.exists(conf.META_FILE):
         await update.message.reply_text("⚠️ Нет кэшированных данных. Отправьте /start.")
         return
 
     try:
-        meta_df = pd.read_csv(META_FILE)
+        meta_df = pd.read_csv(conf.META_FILE)
         if meta_df.empty:
             await update.message.reply_text("Нет значимых новостей за сутки.")
             return
@@ -464,6 +514,17 @@ async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timeline_str = f"{top_row['start_date'][:16]} → {top_row['end_date'][:16]}"
             full_text_preview = safe_get_text(urls[0]) or ""
 
+            # Получаем компоненты горячести (если они есть)
+            hotness_breakdown = {}
+            citation_index = top_row.get('citation_index', len(urls))
+
+            # Если в conf.META_FILE есть breakdown — используем
+            if 'hotness_breakdown' in top_row and pd.notna(top_row['hotness_breakdown']):
+                try:
+                    hotness_breakdown = json.loads(top_row['hotness_breakdown'])
+                except:
+                    pass
+
             raw_output = generate_full_analysis(
                 headline=headline,
                 entities=entities,
@@ -475,20 +536,32 @@ async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             try:
-                analysis = json.loads(fix_json(raw_output))
+                analysis = json.loads(str(fix_json(raw_output)))
             except Exception as e:
                 logger.warning(f"Не удалось распарсить JSON: {e}")
                 continue
 
+            # Добавляем служебные поля для кэша
+            analysis["citation_index"] = citation_index
+            analysis["hotness_breakdown"] = hotness_breakdown
             cache_entries.append(analysis)
 
+            # Формируем вывод
+            hotness_details = (
+                f"🧩 Горячесть: внезапность={hotness_breakdown.get('surprise', 0):.2f}, "
+                f"материальность={hotness_breakdown.get('materiality', 0):.2f}, "
+                f"скорость={hotness_breakdown.get('spread_speed', 0):.2f}, "
+                f"масштаб={hotness_breakdown.get('breadth', 0):.2f}, "
+                f"достоверность={hotness_breakdown.get('credibility', 0):.2f}"
+            )
             output = (
                 f"🔥 <b>{analysis['headline']}</b>\n"
-                f"📊 Горячесть: {analysis['hotness']}\n"
+                f"📊 Горячесть: {analysis['hotness']} | Цитирование: {citation_index}\n"
+                f"{hotness_details}\n"
                 f"⏱ Почему сейчас: {analysis['why_now']}\n"
                 f"🏷 Сущности: {', '.join(analysis['entities'])}\n"
                 f"📅 Хронология: {analysis['timeline']}\n"
-                f"🔗 Источники: {' | '.join([f'<a href=\"{s}\">{i+1}</a>' for i, s in enumerate(analysis['sources']) if s])}\n\n"
+                f"🔗 Источники: {' | '.join([f'<a href=\"{s}\">{i+1}</a>' for i, s in enumerate(analysis['sources']) if s])}\n"
                 f"<b>Черновик:</b>\n"
                 f"<b>{analysis['draft']['title']}</b>\n"
                 f"{analysis['draft']['lead']}\n"
@@ -501,10 +574,12 @@ async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(output, parse_mode="HTML", disable_web_page_preview=True)
             await asyncio.sleep(1)
 
-        with open(RADAR_CACHE_FILE, "w", encoding="utf-8") as f:
+        # Сохраняем в кэш с новыми полями
+        with open(conf.RADAR_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache_entries, f, ensure_ascii=False, indent=2)
 
         await update.message.reply_text("✅ Все новости отправлены и сохранены в кэш!")
+
     except Exception as e:
         logger.exception("Ошибка в /radar")
         await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
@@ -514,7 +589,7 @@ async def radar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------
 
 def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(conf.TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("radar", radar_command))
     logger.info("🚀 Бот запущен. Отправьте /start для загрузки данных.")
