@@ -1,0 +1,10 @@
+services:
+  radar:
+    build:
+      context: src
+      dockerfile: Dockerfile
+    container_name: radar
+    env_file:
+      - .env
+    volumes:
+      - ./cache:/app/cache
