@@ -19,8 +19,8 @@ from bs4 import BeautifulSoup
 # ----------------------------
 # Конфигурация
 # ----------------------------
-TELEGRAM_BOT_TOKEN = "8415814422:AAHlCDAg6oKQiaX7Bwk33DQMdFKJMeePP7g"
-CLOUD_API_KEY = 'YTQzYTRiZjctNjZjOC00ZDMzLTljNTItMjdhODE4MWQxYTQ5.a0d085232d1d09dca2e72cc0c6477054'
+TELEGRAM_BOT_TOKEN = ""
+CLOUD_API_KEY = ''
 
 DATA_FILE = "df_fin.csv"
 META_FILE = "top_clusters_meta.csv"
